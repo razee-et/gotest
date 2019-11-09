@@ -3,16 +3,24 @@ package messagebroker
 import (
 	"crypto/tls"
 	"fmt"
+	"reflect"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/go-stomp/stomp"
+	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
-const defaultContentType = "text/plain"
-const connectionTimeOut = 60*1000
+const connectionTimeOut = 60 * 1000
 const readChannelCapacity = 50
 const writeChannelCapacity = 50
+
+const delimiter = "; "
+const applicationType = "application/x-protobuf"
+const bufType = "acquia-protobuf-name: "
+const ProtobufNamespace = "acquia.messages."
 
 // Client contains necessary values for interacting with the message broker.
 type client struct {
@@ -135,13 +143,15 @@ func (c *client) unsubscribeAll() {
 }
 
 // Receive looks for a message on the given topic.
-func (c *client) Receive(name string) ([]byte, error) {
+func (c *client) Receive(name string) (proto.Message, error) {
+	var result proto.Message
+
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("Recovered in Receive: %v\n", r)
+			debug.PrintStack()
 		}
 	}()
-	ret := []byte(nil)
 
 	subscription := c.getSubscription(name)
 	if subscription == nil {
@@ -159,22 +169,58 @@ func (c *client) Receive(name string) ([]byte, error) {
 	msg := <-subscription.C
 	if msg == nil {
 		err := c.Reconnect()
-		return ret, err
+		return nil, err
 	}
 	if err := c.sc.Ack(msg); err != nil {
-		return ret, err
+		return nil, err
 	}
-	return msg.Body, nil
+	if msg.Header != nil {
+		var t string
+		var err error
+		if t, err = extractContentType(msg.Header.Get("content-type")); err != nil {
+			return nil, err
+		}
+		contentType := proto.MessageType(t)
+		if contentType == nil {
+			return nil, fmt.Errorf("unrecognized message type (%s)", t)
+		}
+		acquiaMessage := reflect.New(contentType.Elem()).Interface().(proto.Message)
+		err = proto.Unmarshal(msg.Body, acquiaMessage)
+		result = acquiaMessage.(proto.Message)
+	}
+	return result, nil
+}
+
+func extractContentType(content string) (string, error) {
+	sections := strings.Split(content, delimiter)
+	if len(sections) > 1 {
+		l := len(bufType)
+		t := sections[1][l:]
+		if t != "" {
+			if strings.Contains(t, ProtobufNamespace) {
+				return t, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("unexpected content-type (%s)", content)
 }
 
 // Send adds a message to the given subscription topic on the message broker.
-func (c *client) Send(name string, message string) error {
+func (c *client) Send(name string, message proto.Message) error {
 	now := time.Now().UTC().UnixNano() / int64(time.Millisecond)
 	expiration := fmt.Sprintf("%d", now+connectionTimeOut)
-	err := c.sc.Send(
+
+	messageName := proto.MessageName(message) // Get the fully-qualified name of "message"'s message type
+	contentType := fmt.Sprintf("%s%s%s%s", applicationType, delimiter, bufType, messageName)
+	bytes, err := proto.Marshal(message)
+	if err != nil {
+		return err
+	}
+
+	err = c.sc.Send(
 		name,
-		defaultContentType,
-		[]byte(message),
+		contentType,
+		bytes,
 		stomp.SendOpt.Receipt,
 		stomp.SendOpt.Header("persistent", "true"),
 		stomp.SendOpt.Header("expires", expiration))
@@ -182,7 +228,13 @@ func (c *client) Send(name string, message string) error {
 		if err == stomp.ErrAlreadyClosed || err == stomp.ErrClosedUnexpectedly {
 			err = c.Reconnect()
 			if err == nil {
-				err = c.sc.Send(name, defaultContentType, []byte(message), stomp.SendOpt.Receipt)
+				err = c.sc.Send(
+					name,
+					contentType,
+					bytes,
+					stomp.SendOpt.Receipt,
+					stomp.SendOpt.Header("persistent", "true"),
+					stomp.SendOpt.Header("expires", expiration))
 			}
 		}
 	}
