@@ -30,6 +30,7 @@ type client struct {
 	username string
 	password string
 	subs     []subscription
+	consumer string
 }
 
 type Client interface {
@@ -47,7 +48,14 @@ type subscription struct {
 }
 
 // Client creates and returns a client for interacting with the message broker.
-func Connect(uri string, username string, password string) (*client, error) {
+func Connect(uri string, username string, password string, consumer string) (*client, error) {
+
+	err := validateTopicParameter(consumer)
+
+	if err != nil {
+		return nil, err
+	}
+
 	netConn, err := tls.Dial("tcp", uri, &tls.Config{})
 
 	if err != nil {
@@ -68,7 +76,7 @@ func Connect(uri string, username string, password string) (*client, error) {
 	}
 
 	subscriptions := make([]subscription, 1)
-	return &client{nc: netConn, sc: stompConn, uri: uri, username: username, password: password, subs: subscriptions}, nil
+	return &client{nc: netConn, sc: stompConn, uri: uri, username: username, password: password, subs: subscriptions, consumer: consumer}, nil
 }
 
 // Disconnect closes all connections.
@@ -84,7 +92,7 @@ func (c *client) Disconnect() error {
 // Reconnect establishes connections again.
 func (c *client) Reconnect() error {
 	c.unsubscribeAll()
-	newClient, err := Connect(c.uri, c.username, c.password)
+	newClient, err := Connect(c.uri, c.username, c.password, c.consumer)
 	c.nc = newClient.nc
 	c.sc = newClient.sc
 	return err
@@ -101,14 +109,20 @@ func (c *client) getSubscription(name string) *stomp.Subscription {
 }
 
 // Subscribe adds a subscription to the client for the given topic.
-func (c *client) Subscribe(name string) error {
-	sub := c.getSubscription(name)
+func (c *client) Subscribe(topicName string) error {
+	topic, error := c.generateReadTopicName(topicName)
+	if error != nil {
+		return error
+	}
+	sub := c.getSubscription(topic)
+
 	if sub != nil {
 		// If already subscribed, do nothing.
 		return nil
 	}
+
 	sub, err := c.sc.Subscribe(
-		name,
+		topic,
 		stomp.AckAuto,
 		stomp.SubscribeOpt.Header("activemq.retroactive", "true"),
 		stomp.SubscribeOpt.Header("activemq.dispatchAsync", "true"))
@@ -116,22 +130,24 @@ func (c *client) Subscribe(name string) error {
 		if err == stomp.ErrAlreadyClosed || err == stomp.ErrClosedUnexpectedly {
 			err = c.Reconnect()
 			if err == nil {
-				sub, err = c.sc.Subscribe(name, stomp.AckClient)
+				sub, err = c.sc.Subscribe(topic, stomp.AckClient)
 			}
 		}
 		if err != nil {
-			errors.Wrapf(err, "Cannot subscribe to %v", name)
+			errors.Wrapf(err, "Cannot subscribe to %v", topic)
 			return err
 		}
 	}
-	c.subs = append(c.subs, subscription{name: name, sub: sub})
+	c.subs = append(c.subs, subscription{name: topic, sub: sub})
 	return nil
 }
 
 // Unsubscribe removes the subscription from the client for the given topic.
-func (c *client) Unsubscribe(name string) {
+func (c *client) Unsubscribe(topicName string) {
+	topic, _ := c.generateReadTopicName(topicName)
+
 	for i, data := range c.subs {
-		if data.name == name {
+		if data.name == topic {
 			c.subs = append(c.subs[:i], c.subs[i+1:]...)
 			return
 		}
@@ -143,8 +159,12 @@ func (c *client) unsubscribeAll() {
 }
 
 // Receive looks for a message on the given topic.
-func (c *client) Receive(name string) (proto.Message, error) {
+func (c *client) Receive(topicName string) (proto.Message, error) {
 	var result proto.Message
+	topic, err := c.generateReadTopicName(topicName)
+	if err != nil {
+		return nil, err
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -153,15 +173,15 @@ func (c *client) Receive(name string) (proto.Message, error) {
 		}
 	}()
 
-	subscription := c.getSubscription(name)
+	subscription := c.getSubscription(topic)
 	if subscription == nil {
-		err := c.Subscribe(name)
+		err := c.Subscribe(topic)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", name)
+			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
 		}
-		subscription = c.getSubscription(name)
+		subscription = c.getSubscription(topic)
 		if subscription == nil {
-			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", name)
+			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
 		}
 
 	}
@@ -190,6 +210,48 @@ func (c *client) Receive(name string) (proto.Message, error) {
 	return result, nil
 }
 
+// Send adds a message to the given subscription topic on the message broker.
+func (c *client) Send(topicName string, message proto.Message) error {
+	now := time.Now().UTC().UnixNano() / int64(time.Millisecond)
+	expiration := fmt.Sprintf("%d", now+connectionTimeOut)
+	topic, err := c.generateWriteTopicName(topicName)
+	if err != nil {
+		return err
+	}
+
+	contentType, err := generateContentType(message)
+	if err != nil {
+		return err
+	}
+	bytes, err := proto.Marshal(message)
+	if err != nil {
+		return err
+	}
+
+	err = c.sc.Send(
+		topic,
+		contentType,
+		bytes,
+		stomp.SendOpt.Receipt,
+		stomp.SendOpt.Header("persistent", "true"),
+		stomp.SendOpt.Header("expires", expiration))
+	if err != nil {
+		if err == stomp.ErrAlreadyClosed || err == stomp.ErrClosedUnexpectedly {
+			err = c.Reconnect()
+			if err == nil {
+				err = c.sc.Send(
+					topic,
+					contentType,
+					bytes,
+					stomp.SendOpt.Receipt,
+					stomp.SendOpt.Header("persistent", "true"),
+					stomp.SendOpt.Header("expires", expiration))
+			}
+		}
+	}
+	return err
+}
+
 func extractMessageName(content string) (string, error) {
 	sections := strings.Split(content, delimiter)
 	if len(sections) > 1 {
@@ -213,40 +275,31 @@ func generateContentType(message proto.Message) (string, error) {
 	return contentType, nil
 }
 
-// Send adds a message to the given subscription topic on the message broker.
-func (c *client) Send(name string, message proto.Message) error {
-	now := time.Now().UTC().UnixNano() / int64(time.Millisecond)
-	expiration := fmt.Sprintf("%d", now+connectionTimeOut)
+func (c *client) generateWriteTopicName(topicName string) (string, error) {
 
-	contentType, err := generateContentType(message)
+	err := validateTopicParameter(topicName)
 	if err != nil {
-		return err
-	}
-	bytes, err := proto.Marshal(message)
-	if err != nil {
-		return err
+		return "", err
 	}
 
-	err = c.sc.Send(
-		name,
-		contentType,
-		bytes,
-		stomp.SendOpt.Receipt,
-		stomp.SendOpt.Header("persistent", "true"),
-		stomp.SendOpt.Header("expires", expiration))
+	return fmt.Sprintf("/topic/%s%s", ProtobufNamespace, topicName), nil
+}
+
+func (c *client) generateReadTopicName(topicName string) (string, error) {
+
+	err := validateTopicParameter(topicName)
+
 	if err != nil {
-		if err == stomp.ErrAlreadyClosed || err == stomp.ErrClosedUnexpectedly {
-			err = c.Reconnect()
-			if err == nil {
-				err = c.sc.Send(
-					name,
-					contentType,
-					bytes,
-					stomp.SendOpt.Receipt,
-					stomp.SendOpt.Header("persistent", "true"),
-					stomp.SendOpt.Header("expires", expiration))
-			}
-		}
+		return "", err
 	}
-	return err
+
+	return fmt.Sprintf("/queue/Consumer.%s.%s%s", c.consumer, ProtobufNamespace, topicName), nil
+}
+
+func validateTopicParameter(name string) error {
+	trimmedName := strings.Trim(name, " ")
+	if trimmedName == "" || strings.Contains(trimmedName, "?") {
+		return fmt.Errorf("topic name or consumer can not be blank or have a '?' character")
+	}
+	return nil
 }
