@@ -3,6 +3,7 @@ package messagebroker
 import (
 	"crypto/tls"
 	"fmt"
+	"os"
 	"reflect"
 	"runtime/debug"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-stomp/stomp"
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/log"
 )
 
 const connectionTimeOut = 60 * 1000
@@ -21,6 +23,7 @@ const delimiter = "; "
 const applicationType = "application/x-protobuf"
 const bufType = "acquia-protobuf-name: "
 const ProtobufNamespace = "acquia.messages."
+const debugEnvVar = "MESSAGE_BROKER_DEBUG"
 
 // Client contains necessary values for interacting with the message broker.
 type client struct {
@@ -49,6 +52,10 @@ type subscription struct {
 
 // Client creates and returns a client for interacting with the message broker.
 func Connect(uri string, username string, password string, consumer string) (*client, error) {
+	insecure := debugger()
+	if insecure {
+		log.Warn("Broker client operating in insecure mode. All TLS certificates will be accepted.")
+	}
 
 	err := validateTopicParameter(consumer)
 
@@ -56,7 +63,7 @@ func Connect(uri string, username string, password string, consumer string) (*cl
 		return nil, err
 	}
 
-	netConn, err := tls.Dial("tcp", uri, &tls.Config{})
+	netConn, err := tls.Dial("tcp", uri, &tls.Config{InsecureSkipVerify: insecure})
 
 	if err != nil {
 		return nil, err
@@ -93,6 +100,10 @@ func (c *client) Disconnect() error {
 func (c *client) Reconnect() error {
 	c.unsubscribeAll()
 	newClient, err := Connect(c.uri, c.username, c.password, c.consumer)
+	if err != nil {
+		log.Error(err)
+		os.Exit(1)
+	}
 	c.nc = newClient.nc
 	c.sc = newClient.sc
 	return err
@@ -173,18 +184,15 @@ func (c *client) Receive(topicName string) (proto.Message, error) {
 		}
 	}()
 
+	err = c.Subscribe(topicName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
+	}
 	subscription := c.getSubscription(topic)
 	if subscription == nil {
-		err := c.Subscribe(topic)
-		if err != nil {
-			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
-		}
-		subscription = c.getSubscription(topic)
-		if subscription == nil {
-			return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
-		}
-
+		return nil, errors.Wrapf(err, "Unable to receive on %v because unable to subscribe", topic)
 	}
+
 	// The channel will not block forever, but instead time out and disconnect if there is no message.
 	msg := <-subscription.C
 	if msg == nil {
@@ -302,4 +310,15 @@ func validateTopicParameter(name string) error {
 		return fmt.Errorf("topic name or consumer can not be blank or have a '?' character")
 	}
 	return nil
+}
+
+// debugger returns whether or not debug mode is active; used for local development.
+func debugger() bool {
+	debug := false
+	val := os.Getenv(debugEnvVar)
+	print("check" + val)
+	if val != "" {
+		debug = true
+	}
+	return debug
 }
