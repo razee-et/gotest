@@ -1,27 +1,11 @@
 package messagebroker
 
-import (
-	"crypto/tls"
-	"fmt"
-	"os"
-	"reflect"
-	"runtime/debug"
-	"strings"
-	"time"
-
-	"github.com/go-stomp/stomp"
-	"github.com/golang/protobuf/proto"
-	"github.com/pkg/errors"
-	"github.com/prometheus/common/log"
-)
-
 // Client contains necessary values for interacting with the message broker.
 type client struct {
 	uri      string
 	username string
 	password string
 }
-
 
 // Client creates and returns a client for interacting with the message broker.
 func Connect(name string) string {
