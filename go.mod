@@ -1,4 +1,4 @@
-module github.com/razee-et/message-broker-sdk-gocopy
+module github.com/razee-et/message-broker-sdk-gocopy/pkg/client
 
 go 1.13
 
